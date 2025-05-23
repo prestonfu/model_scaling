@@ -1,0 +1,17 @@
+jax[cuda12_pip]==0.4.35 
+-f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+flax
+numpy==1.26.4
+scipy==1.12.0
+tfp-nightly==0.20.0.dev20230524
+wandb
+ml_collections
+gymnasium==0.29.1
+mujoco==3.1.6
+mujoco-mjx==3.1.6
+imageio==2.34.2
+gymnax==0.0.8
+brax==0.9.4
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==2.3.1+cpu
+opencv-python==4.10.0.84
