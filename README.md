@@ -6,7 +6,14 @@ A workflow establishing predictability across updates-to-data (UTD) scaling
 and model size scaling for RL, validated across multiple algorithms and environments. 
 This predictability enables scaling laws.
 
-Preston Fu*, Oleh Rybkin*, Zhiyuan Zhou, Michal Nauman, Pieter Abbeel, Sergey Levine, Aviral Kumar
+[Preston Fu](https://prestonfu.com/)<sup>1</sup>\*,
+[Oleh Rybkin](https://people.eecs.berkeley.edu/~oleh/)<sup>1</sup>\*,
+[Zhiyuan Zhou](https://zhouzypaul.github.io/)<sup>1</sup>,
+[Michal Nauman](https://scholar.google.com/citations?user=GnEVRtQAAAAJ&hl=en)<sup>1,2</sup>,
+[Pieter Abbeel](https://people.eecs.berkeley.edu/~pabbeel/)<sup>1</sup>,
+[Sergey Levine](https://people.eecs.berkeley.edu/~svlevine/)<sup>1</sup>,
+[Aviral Kumar](https://aviralkumar2907.github.io/)<sup>3</sup> <br>
+<sup>1</sup>UC Berkeley, <sup>2</sup>University of Warsaw, <sup>3</sup>Carnegie Mellon University
 
 <img src='assets/banner.png'>
 
