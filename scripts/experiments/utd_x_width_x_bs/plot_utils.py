@@ -7,14 +7,15 @@ from copy import deepcopy
 from matplotlib.colors import LogNorm
 import matplotlib.ticker as ticker
 import statsmodels.api as sm
-import matplotlib.patheffects as pe
+import matplotlib.colors as mcolors
+import matplotlib.patches as patches
+import colorsys
 from matplotlib import colormaps
 from functools import partial
 from scripts.utils import abbreviate_number, clean_sci, expand_log_range
-from typing import List, Dict
+from typing import Dict
 from tqdm import tqdm
 from matplotlib.collections import LineCollection
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from matplotlib.colors import LinearSegmentedColormap
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.optimize import curve_fit
@@ -44,14 +45,64 @@ COLORS = [
 ]
 
 
-def plot_learning_curves_with_thresholds(df, var_name, thresholds):
+def lighten_color(color, amount=0.5):
+    """
+    Lightens the given color by multiplying (1-luminosity) by the given amount.
+    Input can be matplotlib color string, hex string, or RGB tuple.
+
+    Examples:
+    >> lighten_color('g', 0.3)
+    >> lighten_color('#F034A3', 0.6)
+    >> lighten_color((.3,.55,.1), 0.5)
+    """
+    try:
+        c = mcolors.cnames[color]
+    except:
+        c = color
+    c = colorsys.rgb_to_hls(*mcolors.to_rgb(c))
+    return mcolors.to_hex(colorsys.hls_to_rgb(c[0], 1 - amount * (1 - c[1]), c[2]))
+
+
+def centered_gradient(hex_color, n=5, reverse=False, light_extent=0.4, dark_extent=1):
+    """Returns light-to-dark gradient as list of hex codes; reverse=True returns dark-to-light"""
+    light_color = lighten_color(hex_color, 1 - light_extent)
+    dark_color = lighten_color(hex_color, 1 + dark_extent)
+    cmap = LinearSegmentedColormap.from_list('gradient', [light_color, dark_color])
+    gradient_colors = [cmap(i / (n - 1)) for i in range(n)]
+    gradient_colors = [mcolors.to_hex(cmap(i / (n - 1))) for i in range(n)]
+    if reverse:
+        return gradient_colors[::-1]
+    else:
+        return gradient_colors
+
+
+def plot_learning_curves_with_thresholds(
+    df,
+    var_name,
+    thresholds,
+    row_attr_name='critic_width',
+    col_attr_name='utd',
+    return_isotonic_key='return_isotonic',
+    mean_return_key='mean_return',
+    std_return_key=None,
+    hline=True,
+    hline_y=1000,
+):
     envs = sorted(df['env_name'].unique())
-    critic_widths = sorted(df['critic_width'].unique())
-    utds = sorted(df['utd'].unique())
+    if row_attr_name is not None:
+        row_attr_values = sorted(df[row_attr_name].unique())
+    else:
+        row_attr_values = [None]
+    if col_attr_name is not None:
+        col_attr_values = sorted(df[col_attr_name].unique())
+    else:
+        col_attr_values = [None]
     var_values = sorted(df[var_name].unique())
     colors = sns.color_palette('viridis', len(var_values))
 
     all_figs = {}
+
+    crossings_warning = False
 
     for env in envs:
         if isinstance(thresholds, list):
@@ -62,26 +113,34 @@ def plot_learning_curves_with_thresholds(df, var_name, thresholds):
             raise ValueError
 
         fig, axes = plt.subplots(
-            len(critic_widths),
-            len(utds),
-            figsize=(len(utds) * 3, len(critic_widths) * 2.5),
+            len(row_attr_values),
+            len(col_attr_values),
+            figsize=(len(col_attr_values) * 3, len(row_attr_values) * 2.5),
             sharex=True,
             sharey=True,
         )
-        axes = np.array(axes).reshape(len(critic_widths), len(utds))
+        axes = np.array(axes).reshape(len(row_attr_values), len(col_attr_values))
 
         lines, labels = [], []
 
-        for i, critic_width in enumerate(critic_widths):
-            for j, utd in enumerate(utds):
+        for i, row_attr_value in enumerate(row_attr_values):
+            for j, col_attr_value in enumerate(col_attr_values):
                 ax = axes[i, j]
-                ax.set_title(f'Critic Width: {critic_width}, UTD: {utd}')
-                ax.axhline(y=1000, color='gray', linestyle='--', alpha=0.5)
+                title = []
+                if row_attr_name is not None:
+                    title.append(f'{row_attr_name}: {row_attr_value}')
+                if col_attr_name is not None:
+                    title.append(f'{col_attr_name}: {col_attr_value}')
+                ax.set_title(', '.join(title))
+                if hline:
+                    ax.axhline(y=hline_y, color='gray', linestyle='--', alpha=0.5)
                 ax.grid(True, alpha=0.3)
 
-                subset = df.query(
-                    f'env_name=="{env}" and utd=={utd} and critic_width=={critic_width}'
-                )
+                subset = df.query(f'env_name=="{env}"')
+                if row_attr_name is not None:
+                    subset = subset.query(f'{row_attr_name}=={row_attr_value}')
+                if col_attr_name is not None:
+                    subset = subset.query(f'{col_attr_name}=={col_attr_value}')
 
                 for _, row in subset.iterrows():
                     color = colors[var_values.index(row[var_name])]
@@ -89,17 +148,42 @@ def plot_learning_curves_with_thresholds(df, var_name, thresholds):
 
                     ax.plot(
                         row['training_step'],
-                        row['mean_return'],
+                        row[mean_return_key],
                         color=color,
                         alpha=0.3,
                     )
+                    if std_return_key is not None:
+                        ax.fill_between(
+                            row['training_step'],
+                            row[mean_return_key] - row[std_return_key],
+                            row[mean_return_key] + row[std_return_key],
+                            alpha=0.2,
+                            color=color,
+                            linewidth=0,
+                        )
+
+                    if 'training_step_resetfilter' in row:
+                        training_step = row['training_step_resetfilter']
+                    else:
+                        training_step = row['training_step']
+
                     line = ax.plot(
-                        row['training_step_resetfilter'],
-                        row['return_isotonic'],
+                        training_step,
+                        row[return_isotonic_key],
                         color=color,
                         alpha=1,
                         label=label,
                     )
+
+                    if label not in labels:
+                        labels.append(label)
+                        lines.append(line[0])
+
+                    if 'crossings' not in row:
+                        if not crossings_warning:
+                            print('Warning: crossings not found')
+                            crossings_warning = True
+                        continue
 
                     # use the crossings column to plot crossings
                     for k, threshold in enumerate(env_thresholds):
@@ -120,10 +204,6 @@ def plot_learning_curves_with_thresholds(df, var_name, thresholds):
                             color=color,
                         )
 
-                    if label not in labels:
-                        labels.append(label)
-                        lines.append(line[0])
-
         idx = [i for i, _ in sorted(enumerate(labels), key=lambda x: float(x[1].split('=')[1]))]
         labels = [labels[i] for i in idx]
         lines = [lines[i] for i in idx]
@@ -136,10 +216,10 @@ def plot_learning_curves_with_thresholds(df, var_name, thresholds):
             fontsize=12,
             bbox_to_anchor=(0.5, 0),
         )
-        plt.suptitle(
-            f'{env}: {var_name}, max threshold {round(env_thresholds[-1], 2)}',
-            fontsize=16,
-        )
+        title = f'{env}: {var_name}'
+        if len(env_thresholds) > 0:
+            title += f', max threshold {round(env_thresholds[-1], 2)}'
+        plt.suptitle(title, fontsize=16)
         plt.tight_layout()
 
         all_figs[env] = fig
@@ -147,150 +227,7 @@ def plot_learning_curves_with_thresholds(df, var_name, thresholds):
     return all_figs
 
 
-def _plot_metric_over_training_per_env(df, var_name, metric, metric_config, **kw):
-    envs = sorted(df['env_name'].unique())
-    critic_widths = sorted(df['critic_width'].unique())
-    utds = sorted(df['utd'].unique())
-    var_values = sorted(df[var_name].unique())
-    colors = sns.color_palette('viridis', len(var_values))
-
-    n_envs = len(envs)
-    n_critic_widths = len(critic_widths)
-    n_utds = len(utds)
-
-    n_cols = min(4, n_envs)
-    n_rows = int(np.ceil(n_envs / n_cols))
-    fig = plt.figure(
-        figsize=(n_critic_widths * n_cols * 2.5, n_utds * n_rows * 2.5),
-        constrained_layout=True,
-    )
-    subfigs = fig.subfigures(n_rows, n_cols, wspace=0.07, hspace=0.07)
-    subfigs = np.array(subfigs).reshape(n_rows, n_cols)
-    lines, labels = [], []
-
-    training_step_rename = 'training_step' if metric != 'return' else 'training_step_resetfilter'
-    metric_rename = metric if metric != 'return' else 'return_resetfilter'
-
-    for env, subfig in zip(envs, subfigs.flatten()):
-        subaxes = subfig.subplots(n_utds, n_critic_widths, sharex=True, sharey=True)
-        subfig.patch.set_facecolor('#f8f8f8')
-        subfig.suptitle(env, fontsize=14)
-
-        ymin, ymax = float('inf'), float('-inf')
-        xmin, xmax = float('-inf'), float('inf')
-        if kw.get('xlim'):
-            xmin, xmax = kw['xlim']
-
-        for i, utd in enumerate(utds):
-            for j, critic_width in enumerate(critic_widths):
-                subset = df.query(
-                    f'env_name=="{env}" and utd=={utd} and critic_width=={critic_width}'
-                )
-                subset.sort_values(by=var_name, inplace=True)
-
-                ax = subaxes[i, j]
-                ax.set_title(f'Critic: {critic_width}, UTD: {utd}')
-                ax.set_xlabel('env step')
-                ax.grid(True, alpha=0.3)
-
-                if 'hline' in metric_config:
-                    ax.axhline(
-                        y=metric_config['hline'],
-                        color='gray',
-                        linestyle='dotted',
-                        alpha=0.5,
-                    )
-
-                for _, row in subset.iterrows():
-                    color = colors[var_values.index(row[var_name])]
-                    label = f'{var_name}={row[var_name]}'
-                    data = pd.DataFrame(
-                        {
-                            'training_step': row[training_step_rename],
-                            f'mean_{metric}': row[f'mean_{metric_rename}'],
-                            f'std_{metric}': row[f'std_{metric_rename}'],
-                        }
-                    )
-                    data = data.dropna()
-                    data = data.rolling(5).mean().dropna()
-
-                    mask = (data['training_step'] >= xmin) & (data['training_step'] <= xmax)
-                    data = data[mask]
-
-                    line = ax.plot(
-                        data['training_step'],
-                        data[f'mean_{metric}'],
-                        color=color,
-                        alpha=1,
-                        label=label,
-                    )
-                    ax.fill_between(
-                        data['training_step'],
-                        data[f'mean_{metric}'] - data[f'std_{metric}'],
-                        data[f'mean_{metric}'] + data[f'std_{metric}'],
-                        alpha=0.2,
-                        color=color,
-                    )
-
-                    if label not in labels:
-                        labels.append(label)
-                        lines.append(line[0])
-
-                    this_ymin = (data[f'mean_{metric}'] - data[f'std_{metric}']).min()
-                    this_ymax = (data[f'mean_{metric}'] + data[f'std_{metric}']).max()
-                    ymin = min(this_ymin, ymin, metric_config.get('hline', float('inf')))
-                    ymax = max(this_ymax, ymax, metric_config.get('hline', float('-inf')))
-                    ymin = max(ymin, metric_config.get('hard_ymin', float('-inf')))
-                    ymax = min(ymax, metric_config.get('hard_ymax', float('inf')))
-
-        for i in range(n_utds):
-            for j in range(n_critic_widths):
-                ax = subaxes[i, j]
-                if metric_config.get('yscale') is None:
-                    margin = 0.1 * (ymax - ymin)
-                    try:
-                        ax.set_ylim(ymin - margin, ymax + margin)
-                    except ValueError:
-                        subfig.delaxes(ax)
-                elif metric_config.get('yscale') == 'log':
-                    ymin = max(ymin, 1e-3)
-                    margin = 0.1 * (np.log10(ymax) - np.log10(ymin))
-                    try:
-                        ax.set_ylim(
-                            10 ** (np.log10(ymin) - margin),
-                            10 ** (np.log10(ymax) + margin),
-                        )
-                    except ValueError:
-                        subfig.delaxes(ax)
-                    ax.set_yscale('log')
-                else:
-                    raise NotImplementedError
-
-    idx = [i for i, _ in sorted(enumerate(labels), key=lambda x: float(x[1].split('=')[1]))]
-    labels = [labels[i] for i in idx]
-    lines = [lines[i] for i in idx]
-
-    fig.legend(
-        lines,
-        labels,
-        loc='upper center',
-        ncol=len(labels),
-        fontsize=12,
-        bbox_to_anchor=(0.5, 0),
-    )
-    plt.suptitle(metric, fontsize=16, y=1.04)
-
-
-def plot_metric_over_training_bs_per_env(df, metric, metric_config, **kw):
-    _plot_metric_over_training_per_env(df, 'batch_size', metric, metric_config, **kw)
-
-
-def plot_metric_over_training_lr_per_env(df, metric, metric_config, **kw):
-    _plot_metric_over_training_per_env(df, 'learning_rate', metric, metric_config, **kw)
-
-
-
-def plot_optimal_hparams_heatmap(best_hparams, key: str):
+def plot_optimal_hparams_heatmap(best_hparams, key: str, group_how=('critic_params', 'utd')):
     envs = sorted(best_hparams['env_name'].unique())
     n_envs = len(envs)
     n_cols = min(4, n_envs)
@@ -309,10 +246,11 @@ def plot_optimal_hparams_heatmap(best_hparams, key: str):
     for i, (env, ax) in enumerate(zip(envs, axes)):
         env_data = best_hparams[best_hparams['env_name'] == env]
         env_data['compute'] = 10 * batch_size * env_data['utd'] * env_data['critic_params']
-        pivot = env_data.pivot(index='utd', columns=['critic_params'], values=key).sort_index(
+        pivot = env_data.pivot(index=group_how[1], columns=[group_how[0]], values=key).sort_index(
             ascending=False
         )
-        pivot.columns = pivot.columns.map(abbreviate_number)
+        if group_how[0] == 'critic_params':
+            pivot.columns = pivot.columns.map(abbreviate_number)
         if 'e' in fmt:
             formatted_annot = pivot.map(clean_sci)
             sns.heatmap(
@@ -876,20 +814,50 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
     batch_size = 256  # TODO: make this dynamic
     envs = sorted(df['env_name'].unique())
     n_envs = len(envs)
-    n_cols = min(3, n_envs)
-    n_rows = int(np.ceil(n_envs / n_cols))
+    n_rows = 2 if n_envs >= 4 else 1
+    n_cols = int(np.ceil(n_envs / n_rows))
 
-    assert set(envs) == {
+    if set(envs) == {
         'DMC-hard',
         'DMC-medium',
         'h1-crawl-v0',
         'h1-pole-v0',
         'h1-stand-v0',
         'humanoid-stand',
-    }
-    envs = ['DMC-medium', 'DMC-hard', 'humanoid-stand', 'h1-crawl-v0', 'h1-pole-v0', 'h1-stand-v0']
+    }:
+        envs = [
+            'DMC-medium',
+            'DMC-hard',
+            'humanoid-stand',
+            'h1-crawl-v0',
+            'h1-pole-v0',
+            'h1-stand-v0',
+        ]
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 4))
+    if set(envs) == {
+        'DMC-hard',
+        'DMC-medium',
+        'h1-crawl-v0',
+        'h1-pole-v0',
+        'h1-stand-v0',
+        'humanoid-stand',
+        'h1-crawl-v0simba',
+        'h1-stand-v0simba',
+    }:
+        envs = [
+            'DMC-medium',
+            'DMC-hard',
+            'h1-crawl-v0',
+            'h1-crawl-v0simba',
+            'humanoid-stand',
+            'h1-pole-v0',
+            'h1-stand-v0',
+            'h1-stand-v0simba',
+        ]
+
+    col_width = kw.get('col_width', 4)
+    row_height = kw.get('row_height', 4)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * col_width, n_rows * row_height))
     axes = np.array(axes).reshape(-1)
 
     if 'interpolated_df' in kw:
@@ -1008,7 +976,13 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
         if mode.startswith('budget') and isinstance(kw['delta'], dict):
             ax.set_title(f'{env} ($\delta$={kw["delta"][env]})', fontsize='xx-large', y=1.05)
         else:
-            ax.set_title(env, fontsize='xx-large', y=1.05)
+            env_fmt = env
+            if any(env.endswith('simba') for env in envs):
+                if 'simba' in env:
+                    env_fmt = env.replace('simba', '') + ', SimbaV2'
+                else:
+                    env_fmt = env + ', BRO'
+            ax.set_title(env_fmt, fontsize='xx-large', y=1.05)
         ax.set_xlabel('utd')
         ax.set_ylabel('critic_params')
         ax.set_yscale('log')
@@ -1063,6 +1037,9 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
         cbar_label = r'$\mathcal{F}_J$: Budget until $J_{\text{env}}$'
 
     for i, (env, ax) in enumerate(zip(envs, axes)):
+        if i in kw.get('remove_axes', []):
+            continue
+
         i_ = i % n_cols
         j_ = i // n_cols
 
@@ -1098,9 +1075,11 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
             else:
                 objective_fn = d_cost
 
-            num_levels = 10
+            num_levels = kw.get('num_levels', 10)
             # iso_levels = np.logspace(np.log10(vmin), np.log10(vmax), num_levels)
             iso_levels = np.logspace(np.log10(zmin), np.log10(zmax), num_levels)
+            plot_first_k_iso_levels = kw.get('plot_first_k_iso_levels', num_levels)
+            iso_levels = iso_levels[-plot_first_k_iso_levels:]
             contour = ax.contour(
                 y_smooth_plot,
                 x_smooth_plot,
@@ -1108,7 +1087,8 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
                 levels=iso_levels,
                 norm=norm,
                 cmap=cmap,
-                linewidths=3,
+                linewidths=[3] * plot_first_k_iso_levels
+                + [0] * (num_levels - plot_first_k_iso_levels),
             )
 
             if mode.startswith('budget'):
@@ -1141,8 +1121,11 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
 
             else:
                 smooth_costs = objective_fn(env, x_smooth_plot, y_smooth_plot, predict_fn)
-
+                cnt = 0
                 for collection, level in zip(contour.collections, iso_levels):
+                    if cnt >= plot_first_k_iso_levels:
+                        break
+                    cnt += 1
                     # for i, (collection, level) in enumerate(zip(contour.collections, iso_levels)):  # crazy matplotlib bug wtf???
                     contour_colors = collection.get_edgecolor()
                     paths = collection.get_paths()
@@ -1212,8 +1195,8 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
                             linestyle='--',
                             alpha=0.8,
                             linewidth=3,
-                            label=f'Compute-optimal' if mode.startswith('data') else 'Data-optimal',
-                            zorder=50,
+                            label='Compute-optimal' if mode.startswith('data') else 'Data-optimal',
+                            zorder=kw.get('line_zorder', 50),
                         )
 
         ax.scatter(
@@ -1257,8 +1240,22 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
         # ax.set_ylim(ymin, ymax)
         # if i == 0:
         if True:
+
+            def format_to_m(value, decimals=1, strip_leading_zero=True):
+                """Format number as millions, e.g. 183000 -> '.2M'."""
+                scaled = round(value / 1e6, decimals)  # scale to millions and round
+                s = f'{scaled:.{decimals}f}'  # fixed decimals
+                if strip_leading_zero:
+                    if s.startswith('0'):  # '.x' instead of '0.x'
+                        s = s[1:]
+                    elif s.startswith('-0'):  # '-.x' instead of '-0.x'
+                        s = '-' + s[2:]
+                return s + 'M'
+
             ax.set_xticks(all_ys)
-            ax.set_xticklabels([abbreviate_number(x) for x in all_ys])
+            ax.set_xticklabels(
+                [format_to_m(x) if x < 1e6 else abbreviate_number(x) for x in all_ys]
+            )
         else:
             ax.set_xticks([])
             ax.set_xticklabels([])
@@ -1272,16 +1269,17 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
             handles.insert(0, iso_line)
             labels.insert(0, iso_label)
             # ax.legend(handles=handles, labels=labels, prop={'size': 14}, ncol=1, frameon=False, loc='lower left')
-            ax.legend(
-                handles=handles,
-                labels=labels,
-                prop={'size': 14},
-                ncol=1,
-                frameon=True,
-                loc='lower left',
-                framealpha=0.5,
-                edgecolor='white',
-            )
+            if kw.get('show_legend', True):
+                ax.legend(
+                    handles=handles,
+                    labels=labels,
+                    prop={'size': 14},
+                    ncol=1,
+                    frameon=True,
+                    loc='lower left',
+                    framealpha=0.5,
+                    edgecolor='white',
+                )
 
         xmin, xmax = expand_log_range(min(all_xs), max(all_xs), amount=final_expand_amt)
         ymin, ymax = expand_log_range(min(all_ys), max(all_ys), amount=final_expand_amt)
@@ -1295,12 +1293,53 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
         #     cbar.set_label(cbar_label, size='xx-large')
         #     cbar.ax.tick_params(labelsize='xx-large')
 
-    plt.tight_layout(rect=[0, 0, 0.9, 1])
+    show_cbar = kw.get('show_cbar', True)
+    use_cbar_spacing = kw.get('cbar_spacing', show_cbar)
 
-    cax = fig.add_axes([0.91, 0.15, 0.015, 0.7])  # Adjust as needed
-    cbar = plt.colorbar(sm, cax=cax)
-    cbar.set_label(cbar_label, size='xx-large')
-    cbar.ax.tick_params(labelsize='xx-large')
+    if use_cbar_spacing:
+        plt.tight_layout(rect=[0, 0, 0.9, 1], w_pad=1.5, h_pad=1.5)
+        cax = fig.add_axes([0.91, 0.15, 0.015, 0.7])  # Adjust as needed
+        cbar = plt.colorbar(sm, cax=cax)
+        cbar.set_label(cbar_label, size='xx-large', color='black' if show_cbar else 'white')
+        cbar.ax.tick_params(labelsize='xx-large')
+
+        if 'cbar_scale' in kw:
+            cbar.ax.text(
+                1.05,
+                1,
+                f'×{kw["cbar_scale"]}',
+                transform=cbar.ax.transAxes,
+                ha='left',
+                va='top',
+                fontsize='x-large',
+                alpha=0.8,
+            )
+            cbar_scale = float(kw['cbar_scale'])
+        else:
+            cbar_scale = 1
+
+        if 'cbar_ticks' in kw:
+            tick_locs = kw['cbar_ticks']
+            tick_labels = [f'{round(tick / cbar_scale)}' for tick in tick_locs]
+            cax.yaxis.set_major_locator(plt.FixedLocator(tick_locs))
+            cax.yaxis.set_minor_locator(plt.NullLocator())
+            cbar.set_ticks(tick_locs, labels=tick_labels, fontsize='xx-large')
+            # cbar.ax.set_yticklabels(tick_labels, fontsize='xx-large')
+
+        if not show_cbar:
+            rect = patches.Rectangle(
+                (0.9, 0),
+                0.1,
+                1,
+                transform=fig.transFigure,
+                facecolor='white',
+                edgecolor='none',
+                zorder=10000,
+            )
+            fig.patches.append(rect)
+
+    else:
+        plt.tight_layout(rect=[0, 0, 1, 1])
 
     # xmin, xmax = expand_log_range(min(global_xs), max(global_xs), amount=final_expand_amt)
     # ymin, ymax = expand_log_range(min(global_ys), max(global_ys), amount=final_expand_amt)
@@ -1308,8 +1347,26 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
     #     ax.set_xlim(xmin, xmax)
     #     ax.set_ylim(ymin, ymax)
 
+    if kw.get('print_axes_locs', False):
+        for i, ax in enumerate(axes):
+            print(f'{i}: {ax.get_position()}')
+
     for i in range(len(envs), len(axes)):
         fig.delaxes(axes[i])
+
+    for i in kw.get('remove_axes', []):
+        axes[i].set_title('')
+        axes[i].axis('off')
+        rect = patches.Rectangle(
+            (0, 0),
+            1,
+            1,
+            transform=axes[i].transAxes,
+            facecolor='white',
+            edgecolor='none',
+            zorder=10000,
+        )
+        axes[i].add_patch(rect)
 
     # plt.subplots_adjust(wspace=0.5)
     # fig.subplots_adjust(right=0.85)
@@ -1320,8 +1377,10 @@ def plot_optimal_hparams_scatter_pretty(df, predict_fn, data_efficiency_key: str
 
     if kw.get('save_path'):
         os.makedirs(os.path.dirname(kw['save_path']), exist_ok=True)
-        plt.savefig(kw['save_path'])
-    plt.show()
+        plt.savefig(kw['save_path'], bbox_inches='tight')
+    if kw.get('show_plot', True):
+        plt.show()
+    plt.close()
 
     plt.rcParams.update(original_rc_params)
 
@@ -1825,12 +1884,12 @@ def insert_budget_fitted_hparams(multiple_budget_optimal_hparams, params_per_thr
     for i, row in multiple_budget_optimal_hparams.iterrows():
         env = row['env_name']
         data_from_budget = np.exp(
-            results[f'budget_to_data_efficiency'][env]['slope'] * np.log(row['opt_budget'])
-            + results[f'budget_to_data_efficiency'][env]['intercept']
+            results['budget_to_data_efficiency'][env]['slope'] * np.log(row['opt_budget'])
+            + results['budget_to_data_efficiency'][env]['intercept']
         )
         compute_from_budget = np.exp(
-            results[f'budget_to_compute'][env]['slope'] * np.log(row['opt_budget'])
-            + results[f'budget_to_compute'][env]['intercept']
+            results['budget_to_compute'][env]['slope'] * np.log(row['opt_budget'])
+            + results['budget_to_compute'][env]['intercept']
         )
         a, alpha, b, beta, c = params_per_thresh[row['threshold_idx']][env][:5]
         utd, critic_params = solve_sigma_n_given_d_c(
@@ -2055,6 +2114,7 @@ def plot_budget_data_compute_opt_pretty(
     compute_yscale=None,
     num_extrapolated_points=None,
     save_path=None,
+    cd_save_path=None,
 ):
     multiple_budget_optimal_hparams['threshold'] = multiple_budget_optimal_hparams.apply(
         lambda row: thresholds_per_env[row['env_name']][row['threshold_idx']], axis=1
@@ -2067,6 +2127,8 @@ def plot_budget_data_compute_opt_pretty(
         'custom_gradient', [qscaled_plot_utils.COLORS[0], qscaled_plot_utils.COLORS[1]]
     )
     delta_latex = r'$\delta$'
+
+    # Plot 1: x = budget, y = data or compute
 
     fig, axes = plt.subplots(n_rows * 2, n_cols, figsize=(n_cols * 4, n_rows * 3.5 * 2))
 
@@ -2197,6 +2259,113 @@ def plot_budget_data_compute_opt_pretty(
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path)
+    plt.show()
+
+    # Plot 2: x = data, y = compute
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 4, n_rows * 3.5))
+    xlabel = r'$\mathcal{D}_{\mathcal{F}_J^*}$: Optimal data'
+    ylabel = r'$\mathcal{C}_{\mathcal{F}_J^*}$: Optimal compute'
+    for j, (env, ax) in enumerate(zip(envs, axes)):
+        if isinstance(data_yticks, list) or data_yticks is None:
+            env_data_ticks = data_yticks
+        elif isinstance(data_yticks, dict):
+            env_data_ticks = data_yticks[env]
+        if isinstance(data_yscale, str) or data_yscale is None:
+            env_data_scale = data_yscale
+        elif isinstance(data_yscale, dict):
+            env_data_scale = data_yscale[env]
+        if isinstance(compute_yticks, list) or compute_yticks is None:
+            env_compute_ticks = compute_yticks
+        elif isinstance(compute_yticks, dict):
+            env_compute_ticks = compute_yticks[env]
+        if isinstance(compute_yscale, str) or compute_yscale is None:
+            env_compute_scale = compute_yscale
+        elif isinstance(compute_yscale, dict):
+            env_compute_scale = compute_yscale[env]
+
+        env_data = multiple_budget_optimal_hparams[
+            multiple_budget_optimal_hparams['env_name'] == env
+        ]
+        env_data = env_data.sort_values(by='opt_budget')
+        x = env_data['data_efficiency']
+        y = env_data['compute']
+        thresholds = env_data['threshold']
+        norm = plt.Normalize(thresholds.min(), thresholds.max())
+        x_fit = x[:-num_extrapolated_points]
+        y_fit = y[:-num_extrapolated_points]
+        thresholds_fit = thresholds[:-num_extrapolated_points]
+        colors_fit = cmap(norm(thresholds_fit))
+        x_extrapolated = x[-num_extrapolated_points:]
+        y_extrapolated = y[-num_extrapolated_points:]
+        thresholds_extrapolated = thresholds[-num_extrapolated_points:]
+        colors_extrapolated = cmap(norm(thresholds_extrapolated))
+        slope, intercept = np.polyfit(np.log(x_fit), np.log(y_fit), 1)
+        line = np.exp(intercept) * x**slope
+        r2 = r_squared(np.log(y), np.log(line))
+        ax.scatter(x_fit, y_fit, c=colors_fit, s=100)
+        ax.scatter(x_extrapolated, y_extrapolated, c=colors_extrapolated, s=100, marker='X')
+        ax.plot(x, line, color='gray', linestyle='--', label=r'$R^2$' + f'={r2:.2f}', linewidth=3)
+
+        # Calculate confidence intervals
+        y_fit_pred = np.exp(intercept) * x_fit**slope
+        residuals = np.log(y_fit) - np.log(y_fit_pred)
+        mean_x = np.mean(np.log(x_fit))
+        n = len(x_fit)
+        t_value = 1.96  # for 95% confidence interval
+        s_err = np.sqrt(np.sum(residuals**2) / (n - 2))
+        conf_interval = (
+            t_value
+            * s_err
+            * np.sqrt(1 / n + (np.log(x) - mean_x) ** 2 / np.sum((np.log(x_fit) - mean_x) ** 2))
+        )
+        lower_bound = np.exp(np.log(line) - conf_interval)
+        upper_bound = np.exp(np.log(line) + conf_interval)
+
+        # Plot confidence interval as a light gray band
+        ax.fill_between(x, lower_bound, upper_bound, color='lightgray', alpha=0.5, zorder=-1)
+
+        if i == 0:
+            # ax.set_title(f'{env} ({delta_latex}={delta_dict[env]})', fontsize='xx-large', y=1.05)
+            ax.set_title(f'{env}', fontsize='xx-large', y=1.05)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        norm = plt.Normalize(env_data['threshold'].min(), env_data['threshold'].max())
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        # cbar.ax.set_ylabel('Threshold', rotation=-90, va="bottom")
+
+        ax.legend(prop={'size': 14}, ncol=1, frameon=False, loc='lower right')
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes('right', size='5%', pad=0.2)
+        cbar = plt.colorbar(sm, cax=cax)
+        cbar.ax.tick_params(labelsize='xx-large')
+        if j == len(envs) - 1:
+            cbar.set_label('$J$: Performance level', size='xx-large')
+
+        rliable_plot_utils._annotate_and_decorate_axis(
+            ax,
+            xlabel=xlabel,
+            ylabel=ylabel if j == 0 else '',
+            labelsize='xx-large',
+            ticklabelsize='xx-large',
+            grid_alpha=0.2,
+            legend=False,
+        )
+        ax.yaxis.set_label_coords(-0.25, 0.5)
+
+        qscaled_plot_utils.ax_set_x_bounds_and_scale(
+            ax, xticks=env_data_ticks, xscale=env_data_scale
+        )
+        qscaled_plot_utils.ax_set_y_bounds_and_scale(
+            ax, yticks=env_compute_ticks, yscale=env_compute_scale
+        )
+
+        # plt.suptitle(title, fontsize=14)
+    plt.tight_layout(h_pad=4.0)
+    if cd_save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(cd_save_path)
     plt.show()
 
 

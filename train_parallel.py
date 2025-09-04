@@ -1,7 +1,7 @@
 import os
+import glob
 
 os.environ['MUJOCO_GL'] = 'egl'
-# os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
 if 'TPU_VISIBLE_DEVICES' not in os.environ:
     gpu_id = os.environ.get('CUDA_VISIBLE_DEVICES', '0')
@@ -16,14 +16,13 @@ else:
 
 import random
 import time
-from copy import deepcopy
 
 import numpy as np
 import wandb
 from absl import app, flags
 from jaxrl.agents import agents
 from jaxrl.envs.new_env import make_env
-from jaxrl.replay_buffer import ParallelReplayBuffer
+from jaxrl.replay_buffer import ParallelReplayBuffer, NStepParallelReplayBuffer
 from jaxrl.utils import (
     RollingMeter,
     Timer,
@@ -43,6 +42,8 @@ flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_episodes', 5, 'Number of episodes used for evaluation.')
 flags.DEFINE_integer('eval_interval', 25000, 'Eval interval.')
+flags.DEFINE_boolean('save_checkpoints', False, 'Save checkpoints.')
+flags.DEFINE_integer('save_interval', 100_000, 'Checkpoint saving interval.')
 flags.DEFINE_integer('max_steps', int(2000000), 'Number of training steps.')
 flags.DEFINE_integer('replay_buffer_size', int(1000000), 'Number of training steps.')
 flags.DEFINE_integer('start_training', int(2500), 'Number of training steps to start training.')
@@ -51,49 +52,22 @@ flags.DEFINE_string('benchmark', 'dmc', 'Environment name.')
 flags.DEFINE_string('env_name', 'cheetah-run', 'Environment name.')
 flags.DEFINE_boolean('offline_evaluation', True, 'Do offline eval.')
 flags.DEFINE_boolean('tqdm', False, 'Use tqdm.')
-flags.DEFINE_string('wandb_entity', 'anonymous', 'Wandb entity.')
+flags.DEFINE_string('wandb_entity', 'prestonfu', 'Wandb entity.')
 flags.DEFINE_string('wandb_project', 'BRO_model_scaling', 'Wandb project.')
-flags.DEFINE_string('wandb_tag', None, 'Wandb tag.')
+flags.DEFINE_string('wandb_tag', 'debug', 'Wandb tag.')
+flags.DEFINE_boolean('stop_at_success', True, 'Stop at threshold given in stop_at_offline_return.')
+flags.DEFINE_integer('n_step', 1, 'N-step TD.')
+flags.DEFINE_boolean('use_nstep_replay_buffer', False, '(buggy) Use n-step replay buffer.')
+
+# saving and loading
+flags.DEFINE_string('load_checkpoint_dir', None, 'Path within save_dir / wandb_tag directory.')
+flags.DEFINE_integer('load_checkpoint_step', 100_000, 'Step of the checkpoint to load.')
+flags.DEFINE_bool('load_actor_only', False, 'Load actor only.')
+flags.DEFINE_bool('load_critic_only', False, 'Load critic only.')
+flags.DEFINE_bool('load_separate_critic_only', False, 'Load separate critic only.')
 
 flags.DEFINE_boolean('validation', True, 'Whether to log validation.')
-flags.DEFINE_integer(
-    'validation_interval', 10, 'Validation frequency (relative to train env step).'
-)
-
-flags.DEFINE_boolean(
-    'log_replay_tderr',
-    True,
-    'Whether to log td error on data sampled from replay buffer.',
-)
-flags.DEFINE_integer('replay_compute_interval', 500, 'New data td error computation frequency.')
-flags.DEFINE_integer('replay_oldnew_batch_size', 256, 'Batch size for new data.')
-
-flags.DEFINE_boolean('log_old_target_tderr', True, 'Whether to log td error on old target.')
-flags.DEFINE_integer(
-    'old_target_compute_interval',
-    1000,
-    'Old target network TD error computation frequency (env steps).',
-)
-flags.DEFINE_list(
-    'old_target_update_intervals',
-    ['1', '2', '4', '8', '16', '32', '64', '128', '256', '512'],
-    'Old target network update frequency (env steps).',
-)
-
-flags.DEFINE_boolean('log_grad_var', True, 'Whether to log td error on old target.')
-flags.DEFINE_integer('grad_var_compute_interval', 500, 'Gradient variance computation frequency.')
-flags.DEFINE_integer('grad_var_batch_size', 256, 'Batch size for gradient variance.')
-
-flags.DEFINE_boolean(
-    'log_batch_size_grads', True, 'Whether to log gradient norm for different batch sizes.'
-)
-flags.DEFINE_integer('batch_size_grads_compute_interval', 500, 'Batch size grads compute interval.')
-flags.DEFINE_integer(
-    'smallest_batch_size_grad', 64, 'Every power of 2 between smallest and largest.'
-)
-flags.DEFINE_integer(
-    'largest_batch_size_grad', 1024, 'Every power of 2 between smallest and largest.'
-)
+flags.DEFINE_integer('validation_interval', 10, 'Validation frequency (env steps).')
 
 flags.DEFINE_string('tpu_project', '', 'TPU project.')
 flags.DEFINE_string('tpu_name', '', 'TPU name.')
@@ -102,57 +76,38 @@ config_flags.DEFINE_config_file(
     'agent', 'jaxrl/agents/bro_minimal/bro_minimal_learner.py', lock_config=False
 )
 
-"""
-class flags:
-    save_dir = './tmp/'
-    seed=0
-    eval_episodes=1
-    eval_interval=2000
-    batch_size=int(256)
-    max_steps=int(500000)
-    replay_buffer_size=int(500000)
-    start_training=int(1000)
-    updates_per_step=int(2)
-    num_seeds=2
-    benchmark='dmc'
-    env_name='cheetah-run'
-    offline_evaluation = False
-    width_critic=512
-        
-FLAGS = flags()
-"""
-
 
 def validate_args():
-    def is_power_of_two(x: int):
-        return (x & (x - 1)) == 0 and x > 0
+    if FLAGS.n_step > 1:
+        assert FLAGS.use_nstep_replay_buffer
+        assert not FLAGS.validation or FLAGS.validation_interval == 1, 'Not implemented yet'
 
-    def divisor_or_multiple(x: int, y: int):
-        return x % y == 0 or y % x == 0
 
-    if FLAGS.old_target_update_intervals:
-        FLAGS.old_target_update_intervals = [int(x) for x in FLAGS.old_target_update_intervals]
-
-    if FLAGS.log_batch_size_grads:
-        assert is_power_of_two(FLAGS.smallest_batch_size_grad) and is_power_of_two(
-            FLAGS.largest_batch_size_grad
+def find_checkpoint_path(checkpoint_dir, width_critic=None):
+    # assume that checkpoint_dir is the save_dir / wandb_tag directory
+    # look for the run_id that matches the current seed
+    if width_critic is None:
+        width_critic = FLAGS.agent.width_critic
+    # run_spec = f"utd{FLAGS.agent.updates_per_step}_bs{FLAGS.agent.batch_size}_critic{width_critic}"
+    matching_run = glob.glob(
+        os.path.join(
+            checkpoint_dir,  # pass in full checkpoint dir including wandb id
+            f'step_{FLAGS.load_checkpoint_step}',
         )
-
-    if FLAGS.log_grad_var and FLAGS.log_batch_size_grads:
-        assert divisor_or_multiple(
-            FLAGS.grad_var_compute_interval, FLAGS.batch_size_grads_compute_interval
-        )
-        batch_sizes = np.arange(
-            np.log2(FLAGS.smallest_batch_size_grad),
-            np.log2(FLAGS.largest_batch_size_grad) + 1,
-        )
-        batch_sizes = np.power(2, batch_sizes).astype(int)
-        assert FLAGS.grad_var_batch_size in batch_sizes
+    )
+    assert len(matching_run) >= 1, breakpoint()  # f"No matching run found"
+    checkpoint_path = matching_run[0]
+    assert os.path.exists(checkpoint_path)
+    return checkpoint_path
 
 
 def main(_):
     validate_args()
     config = FLAGS.agent
+    if config['target_noise_kind'] == 'pretrained':
+        config['target_pretrained_path'] = find_checkpoint_path(
+            config['target_pretrained_path'], width_critic=config['target_pretrained_critic_width']
+        )
 
     MAX_EPISODE_LENGTHS = {
         'shadowhand': 100,
@@ -160,6 +115,7 @@ def main(_):
         'dmc': 1000,
         'humanoid_bench': 1000,
     }
+
     stop_at_offline_return = {
         'acrobot-swingup': 500,
         'cheetah-run': 800,
@@ -204,24 +160,58 @@ def main(_):
         num_seeds=FLAGS.num_seeds,
         config=config,
     )
+    # load checkpoint if specified
+    if FLAGS.load_checkpoint_dir is not None:
+        assert os.path.exists(FLAGS.load_checkpoint_dir)
+        checkpoint_path = find_checkpoint_path(FLAGS.load_checkpoint_dir)
+        if FLAGS.load_actor_only:
+            agent.load_actor(checkpoint_path)
+        elif FLAGS.load_critic_only:
+            agent.load_critic(checkpoint_path)
+        elif FLAGS.load_separate_critic_only:
+            agent.load_separate_critic(checkpoint_path)
+        else:
+            agent.load(checkpoint_path)
     config['model_size'] = agent.get_num_params()
-    replay_buffer = ParallelReplayBuffer(
-        env.observation_space,
-        env.action_space.shape[-1],
-        FLAGS.replay_buffer_size,
-        num_seeds=FLAGS.num_seeds,
-    )
+
+    if not FLAGS.use_nstep_replay_buffer:
+        replay_buffer = ParallelReplayBuffer(
+            env.observation_space,
+            env.action_space.shape[-1],
+            FLAGS.replay_buffer_size,
+            num_seeds=FLAGS.num_seeds,
+            gamma=FLAGS.agent.discount,
+        )
+    else:
+        replay_buffer = NStepParallelReplayBuffer(
+            env.observation_space,
+            env.action_space.shape[-1],
+            FLAGS.replay_buffer_size,
+            num_seeds=FLAGS.num_seeds,
+            n_step=FLAGS.n_step,
+            gamma=FLAGS.agent.discount,
+        )
+
     observations = env.reset()
     if FLAGS.validation:
         val_observations = val_env.reset()
-        val_replay_buffer = ParallelReplayBuffer(
-            val_env.observation_space,
-            val_env.action_space.shape[-1],
-            FLAGS.replay_buffer_size,
-            num_seeds=FLAGS.num_seeds,
-        )
-
-    run_id = init_wandb(FLAGS, config)
+        if not FLAGS.use_nstep_replay_buffer:
+            val_replay_buffer = ParallelReplayBuffer(
+                val_env.observation_space,
+                val_env.action_space.shape[-1],
+                FLAGS.replay_buffer_size,
+                num_seeds=FLAGS.num_seeds,
+                gamma=FLAGS.agent.discount,
+            )
+        else:
+            val_replay_buffer = NStepParallelReplayBuffer(
+                val_env.observation_space,
+                val_env.action_space.shape[-1],
+                FLAGS.replay_buffer_size,
+                num_seeds=FLAGS.num_seeds,
+                n_step=FLAGS.n_step,
+                gamma=FLAGS.agent.discount,
+            )
 
     returns_online = np.zeros(FLAGS.num_seeds)
     goals_online = np.zeros(FLAGS.num_seeds)
@@ -231,20 +221,24 @@ def main(_):
 
     rolling_meter = RollingMeter(FLAGS.log_interval)
 
-    if FLAGS.log_old_target_tderr:
-        save_dir = os.path.join(FLAGS.save_dir, run_id)
-        os.makedirs(save_dir, exist_ok=True)
-        old_target_critic = {
-            interval: deepcopy(agent.target_critic)
-            for interval in FLAGS.old_target_update_intervals
-        }
-        n_gradient_steps = 0
-        hard_target_recent_update = 0
+    run_id = init_wandb(FLAGS, config)
+
+    save_dir = os.path.join(FLAGS.save_dir, FLAGS.wandb_tag, f'{run_id}')
+    os.makedirs(save_dir, exist_ok=True)
+    os.chmod(save_dir, 0o777)  # Set directory permissions to rwxrwxrwx
+
+    n_gradient_steps = 0
+    hard_target_recent_update = 0
 
     start_time = time.time()
     stop = False
+    stop_threshold = stop_at_offline_return.get(FLAGS.env_name, float('inf'))
 
     for i in tqdm(range(1, FLAGS.max_steps + 1), disable=not FLAGS.tqdm or is_using_slurm()):
+        # save the agent
+        if FLAGS.save_checkpoints and i % FLAGS.save_interval == 0:
+            agent.save(os.path.join(save_dir, f'step_{i}'))
+
         with Timer('sample_action'):
             if i < FLAGS.start_training:
                 actions = env.action_space.sample()
@@ -307,98 +301,6 @@ def main(_):
                 config['batch_size'], config['updates_per_step'], include_idx=True
             )
 
-            with Timer('replay_tderr'):
-                if FLAGS.log_replay_tderr and i % FLAGS.replay_compute_interval == 0:
-                    replay_batches = replay_buffer.sample_parallel_multibatch(
-                        FLAGS.replay_oldnew_batch_size, 1
-                    )
-                    replay_critic_loss = agent.compute_critic_loss(replay_batches)
-                    rolling_meter.add(i, 'replay_critic_loss', replay_critic_loss)
-
-                    q_info = agent.compute_critic_batch(replay_batches)
-                    rolling_meter.add_dict(i, prefix_metrics(q_info, 'replay_', sep=''))
-
-                    if config['use_separate_critic']:
-                        separate_q_info = agent.compute_separate_critic_batch(replay_batches)
-                        rolling_meter.add_dict(
-                            i, prefix_metrics(separate_q_info, 'sep_replay_', sep='')
-                        )
-
-                    old_data_batches = replay_buffer.sample_earliest_multibatch(
-                        FLAGS.replay_oldnew_batch_size, 1
-                    )
-                    old_data_critic_losses = agent.compute_critic_loss(old_data_batches)
-                    rolling_meter.add(i, 'old_data_critic_loss', old_data_critic_losses)
-
-                    new_data_batches = replay_buffer.sample_latest_multibatch(
-                        FLAGS.replay_oldnew_batch_size, 1
-                    )
-                    new_data_critic_losses = agent.compute_critic_loss(new_data_batches)
-                    rolling_meter.add(i, 'new_data_critic_loss', new_data_critic_losses)
-
-                    if config['use_separate_critic']:
-                        replay_separate_critic_loss = agent.compute_critic_loss(
-                            replay_batches, critic=agent.separate_critic
-                        )
-                        rolling_meter.add(
-                            i, 'replay_separate_critic_loss', replay_separate_critic_loss
-                        )
-
-                        old_data_separate_critic_losses = agent.compute_critic_loss(
-                            old_data_batches, critic=agent.separate_critic
-                        )
-                        rolling_meter.add(
-                            i, 'old_data_separate_critic_loss', old_data_separate_critic_losses
-                        )
-
-                        new_data_separate_critic_losses = agent.compute_critic_loss(
-                            new_data_batches, critic=agent.separate_critic
-                        )
-                        rolling_meter.add(
-                            i, 'new_data_separate_critic_loss', new_data_separate_critic_losses
-                        )
-
-            with Timer('grad_var'):
-                if FLAGS.log_grad_var and i % FLAGS.grad_var_compute_interval == 0:
-                    # subsample from training batch
-                    grad_var_idx = np.random.choice(
-                        update_batches_idx.flatten(),
-                        size=(config['updates_per_step'], FLAGS.grad_var_batch_size),
-                    )
-                    grad_var_batches = replay_buffer.get_at_index(grad_var_idx)
-                    grad_var_infos = agent.compute_critic_grad_var(grad_var_batches)
-                    grad_var_norm = grad_var_infos['sum_critic_grad_var']
-                    adam_grad_var_infos = agent.get_adam_critic_grad_var()
-                    rolling_meter.add_dict(i, grad_var_infos | adam_grad_var_infos)
-
-            with Timer('batch_size_grads'):
-                if FLAGS.log_batch_size_grads and i % FLAGS.batch_size_grads_compute_interval == 0:
-                    batch_size_grad_norms = {}
-                    batch_sizes = np.arange(
-                        np.log2(FLAGS.smallest_batch_size_grad),
-                        np.log2(FLAGS.largest_batch_size_grad) + 1,
-                    )
-                    batch_sizes = np.power(2, batch_sizes).astype(int)
-                    for batch_size in batch_sizes:
-                        batch = replay_buffer.sample_parallel_multibatch(batch_size, 1)
-                        batch_size_grad_norms[f'grad_norm_b{batch_size}'] = (
-                            agent.compute_critic_grad_norm(batch)
-                        )
-                        if config['use_separate_critic']:
-                            batch_size_grad_norms[f'sep_grad_norm_b{batch_size}'] = (
-                                agent.compute_separate_critic_grad_norm(batch)
-                            )
-
-                    rolling_meter.add_dict(i, batch_size_grad_norms)
-
-                    if FLAGS.log_grad_var and i % FLAGS.grad_var_compute_interval == 0:
-                        rolling_meter.add(
-                            i,
-                            'relative_grad_var',
-                            grad_var_norm
-                            / batch_size_grad_norms[f'grad_norm_b{FLAGS.grad_var_batch_size}'] ** 2,
-                        )
-
             with Timer('update'):
                 should_hard_target_update = (
                     config.hard_target_update
@@ -416,30 +318,13 @@ def main(_):
                     hard_target_recent_update = n_gradient_steps
                 all_infos.update(update_infos)
 
-            with Timer('replay_tderr'):
-                if FLAGS.log_replay_tderr and i % FLAGS.replay_compute_interval == 0:
-                    postupd_replay_critic_loss = agent.compute_critic_loss(replay_batches)
-                    rolling_meter.add(i, 'postupd_replay_critic_loss', postupd_replay_critic_loss)
-
-                    postupd_q_info = agent.compute_critic_batch(replay_batches)
-                    rolling_meter.add_dict(
-                        i, prefix_metrics(postupd_q_info, 'postupd_replay_', sep='')
-                    )
-
-                    if config['use_separate_critic']:
-                        separate_postupd_q_info = agent.compute_separate_critic_batch(
-                            replay_batches
-                        )
-                        rolling_meter.add_dict(
-                            i,
-                            prefix_metrics(separate_postupd_q_info, 'sep_postupd_replay_', sep=''),
-                        )
-
             with Timer('validation'):
                 if FLAGS.validation and i % FLAGS.validation_interval == 0:
                     val_batches = val_replay_buffer.sample_parallel_multibatch(
                         config['batch_size'], 1
                     )
+                    val_q_info = agent.compute_critic_batch(val_batches)
+                    rolling_meter.add_dict(i, prefix_metrics(val_q_info, 'val_', sep=''))
                     val_critic_loss = agent.compute_critic_loss(val_batches)
                     rolling_meter.add(i, 'validation_critic_loss', val_critic_loss)
 
@@ -449,13 +334,21 @@ def main(_):
                         )
                         rolling_meter.add(i, 'sep_validation_critic_loss', sep_val_critic_loss)
 
+            quotient_counts = np.where(counts == 0.0, 1e-8, counts)
+            infos_online_eval = {
+                'goal_online': goals_online / quotient_counts,
+                'return_online': returns_online / quotient_counts,
+            }
+
             with Timer('offline_eval'):
                 if FLAGS.offline_evaluation and i % FLAGS.eval_interval == 0:
                     eval_stats = eval_env.evaluate(
                         agent, num_episodes=FLAGS.eval_episodes, temperature=0.0
                     )
-                    if eval_stats['return'].mean() > stop_at_offline_return.get(
-                        FLAGS.env_name, float('inf')
+                    if (
+                        FLAGS.stop_at_success
+                        and infos_online_eval['return_online'].mean() > stop_threshold
+                        and eval_stats['return'].mean() > stop_threshold
                     ):
                         stop = True
                     all_infos.update(eval_stats)
@@ -463,38 +356,21 @@ def main(_):
             if config.use_reset and i % (config.reset_interval // config.updates_per_step) == 0:
                 agent.reset()
 
-            # use post-update target
-            with Timer('old_target_tderr'):
-                if FLAGS.log_old_target_tderr:
-                    for interval in FLAGS.old_target_update_intervals:
-                        if (i + interval) % FLAGS.old_target_compute_interval == 0:
-                            old_target_critic[interval] = old_target_critic[interval].replace_(
-                                params=agent.target_critic.params
-                            )
-                    if i % FLAGS.old_target_compute_interval == 0:
-                        for interval in FLAGS.old_target_update_intervals:
-                            old_target_critic_loss = agent.compute_critic_loss(
-                                update_batches, target_critic=old_target_critic[interval]
-                            )
-                            rolling_meter.add(
-                                i, f'old_target_critic_loss_{interval}', old_target_critic_loss
-                            )
-
             if i % FLAGS.log_interval == 0:
                 # Log online stats
-                counts = np.where(counts == 0.0, 1e-8, counts)
-                infos_online_eval = {
-                    'goal_online': goals_online / counts,
-                    'return_online': returns_online / counts,
-                }
-
                 all_infos.update(infos_online_eval)
                 returns_online = np.zeros(FLAGS.num_seeds)
                 goals_online = np.zeros(FLAGS.num_seeds)
                 counts = np.zeros(FLAGS.num_seeds)
 
                 all_infos.update(rolling_meter.get_log_data())
-                log_seeds_to_wandb(i, all_infos)
+                try:
+                    log_seeds_to_wandb(i, all_infos)
+                except Exception as e:
+                    print(f'Error logging to wandb: {e}')
+                    for k, v in all_infos.items():
+                        print(f'{k}: {v}')
+                    raise e
 
                 end_time = time.time()
                 times_dict = Timer.get_totals()

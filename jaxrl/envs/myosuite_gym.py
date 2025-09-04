@@ -1,7 +1,6 @@
 import gym
 import numpy as np
 from gymnasium import spaces
-import myosuite
 
 MYOSUITE_TASKS = {
     'myo-test': 'myoElbowPose1D6MRandom-v0',

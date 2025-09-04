@@ -1,9 +1,0 @@
-numpy==1.26.4
-scipy==1.12.0
-jax==0.4.35
-jaxlib==0.4.35
-flax
-imageio
-tfp-nightly==0.20.0.dev20230524
-wandb
-ml_collections

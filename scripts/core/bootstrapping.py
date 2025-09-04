@@ -10,7 +10,7 @@ from typing import Dict
 
 from rliable import plot_utils as rliable_plot_utils
 from qscaled.utils import plot_utils as qscaled_plot_utils
-from qscaled.core.preprocessing import get_envs, get_utds
+from qscaled.core.preprocessing import get_envs
 
 from scripts.utils import abbreviate_number, expand_log_range
 from scripts.core.fitting import (
@@ -84,7 +84,9 @@ def compute_time_to_threshold(df, param_name, threshold_idx=-1):
     return pd.DataFrame(results)
 
 
-def _grid_best_uncertainty(df, param_name, threshold_idx, print_pivot):
+def _grid_best_uncertainty(
+    df, param_name, threshold_idx, print_pivot=False, goodness_criteria='overlap'
+):
     """
     Almost identical to the same method from qscaled, but now also grouped by model size.
 
@@ -128,6 +130,9 @@ def _grid_best_uncertainty(df, param_name, threshold_idx, print_pivot):
         time_to_threshold_bootstrap = good_param_groups.apply(
             lambda x: x['crossings_bootstrap'].iloc[0][:, threshold_idx]
         )
+        if len(time_to_threshold_bootstrap) == 0:
+            # print('debug', time_to_threshold_bootstrap)
+            continue
         times_bootstrap = np.array(time_to_threshold_bootstrap.tolist())
 
         # Find best learning rate (batch size)
@@ -149,15 +154,22 @@ def _grid_best_uncertainty(df, param_name, threshold_idx, print_pivot):
             min_time_rounded = float('inf')
 
         # Solution 1: overlapping errorbars
-        try:
-            param_good_enough = (time_to_threshold - time_to_threshold[best_value]) <= np.sqrt(
-                (time_to_threshold_std[best_value]) ** 2 + time_to_threshold_std**2
-            )
-        except:
-            print(time_to_threshold)
-            print(time_to_threshold_std)
-            print(best_value)
-            raise
+        if goodness_criteria == 'overlap':
+            try:
+                param_good_enough = (time_to_threshold - time_to_threshold[best_value]) <= np.sqrt(
+                    (time_to_threshold_std[best_value]) ** 2 + time_to_threshold_std**2
+                )
+            except:
+                print(time_to_threshold)
+                print(time_to_threshold_std)
+                print(best_value)
+                raise
+        elif goodness_criteria.startswith('fraction'):
+            fraction = float(goodness_criteria.split('_')[-1])
+            param_good_enough = time_to_threshold <= time_to_threshold[best_value] * (1 + fraction)
+        else:
+            raise ValueError(f'Invalid goodness criteria: {goodness_criteria}')
+
         good_enough_params = param_good_enough.index[param_good_enough]
         smallest_good_enough_param = good_enough_params.min()
         is_smallest_param = smallest_good_enough_param == min(good_param_values)
@@ -185,7 +197,9 @@ def _grid_best_uncertainty(df, param_name, threshold_idx, print_pivot):
                 group_key: group_value,  # batch size (learning rate)
                 'utd': utd,
                 'critic_width': critic_width,
-                'critic_params': int(group['critic_params'].mean()),
+                'critic_params': int(group['critic_params'].mean())
+                if 'critic_params' in group
+                else None,
                 f'best_{param_name}': best_value,
                 'time_to_threshold': min_time,
                 f'best_{param_name}_bootstrap': best_value_bootstrap,
@@ -230,22 +244,22 @@ def _grid_best_uncertainty(df, param_name, threshold_idx, print_pivot):
     return df_best
 
 
-def grid_best_uncertainty_lr(df, threshold_idx=-1, print_pivot=False):
+def grid_best_uncertainty_lr(df, *args, **kwargs):
     """
     Make and print a table with uncertainty-corrected best learning rate for
     each environment, batch size, and UTD with environment as rows and
     utd x batch size as columns.
     """
-    return _grid_best_uncertainty(df, 'lr', threshold_idx, print_pivot)
+    return _grid_best_uncertainty(df, 'lr', *args, **kwargs)
 
 
-def grid_best_uncertainty_bs(df, threshold_idx=-1, print_pivot=False):
+def grid_best_uncertainty_bs(df, *args, **kwargs):
     """
     Make and print a table with uncertainty-corrected best batch size for
     each environment, learning rate, and UTD with environment as rows and
     utd x learning rate as columns.
     """
-    return _grid_best_uncertainty(df, 'bs', threshold_idx, print_pivot)
+    return _grid_best_uncertainty(df, 'bs', *args, **kwargs)
 
 
 def print_optimal_hparams(best_bs, best_lr):
@@ -287,6 +301,33 @@ def build_log_features(df, xcols, interaction=False):
         interaction_term = X[:, 0] * X[:, 1]
         X = np.column_stack([X, interaction_term])
     return sm.add_constant(X)
+
+
+def fit_single_log_linear(df, xcol, ycol):
+    """Fit a log-linear model"""
+    intercepts = {}
+    slopes = {}
+    r2s = {}
+
+    for env, group in df.groupby('env_name'):
+        X = np.log(group[[xcol]].values)
+        X = sm.add_constant(X)  # Add intercept term
+        y = np.log(group[ycol].values)
+        idx = (~np.isnan(y)) & (y < np.inf) & (y > -np.inf)
+        y = y[idx]
+        X = X[idx]
+        model = sm.OLS(y, X).fit()
+
+        intercept, slope = model.params
+        r2 = model.rsquared
+        intercepts[env] = intercept
+        slopes[env] = [slope]
+        r2s[env] = r2
+
+        fit_str = f'{env}: log {ycol} ~ {intercept:.4e} + {slope:.4f} * log {xcol}'
+        print(fit_str)
+
+    return model, slopes, intercepts, r2s
 
 
 def fit_log_linear_helper(df, xcols, ycol, interaction=False):
@@ -380,6 +421,13 @@ def predict_log_linear(df, xcols, slope, intercept):
     df_slopes = np.stack(df['env_name'].map(slope).values)
     df_intercepts = df['env_name'].map(intercept).values
     x = df[xcols].values
+    return np.exp(df_intercepts + (np.log(x) * df_slopes).sum(axis=1))
+
+
+def predict_log_linear_single(df, xcol, slope, intercept):
+    df_slopes = np.stack(df['env_name'].map(slope).values)
+    df_intercepts = df['env_name'].map(intercept).values
+    x = df[[xcol]].values
     return np.exp(df_intercepts + (np.log(x) * df_slopes).sum(axis=1))
 
 
@@ -527,9 +575,18 @@ def predict_sum_power(df, xcols, params_dict):
 
 
 def insert_predictions(df, xcols, ycol):
-    assert xcols == ['utd', 'critic_params'], 'For now'
+    # assert xcols == ['utd', 'critic_params'], 'For now'
     model, slope, intercept, r2 = fit_log_linear(df, xcols, ycol)
     df[f'{ycol}_loglinear'] = predict_log_linear(df, xcols, slope, intercept)
+    return df, (model, slope, intercept, r2)
+
+
+def insert_predictions_single(df, xcol, ycol):
+    if isinstance(xcol, list):
+        assert len(xcol) == 1
+        xcol = xcol[0]
+    model, slope, intercept, r2 = fit_single_log_linear(df, xcol, ycol)
+    df[f'{ycol}_loglinear_{xcol}'] = predict_log_linear_single(df, xcol, slope, intercept)
     return df, (model, slope, intercept, r2)
 
 
@@ -1015,6 +1072,34 @@ def _plot_optimal_hparam_fit_per_env_helper(
     else:
         compute_optimal_df = pd.DataFrame(columns=df.columns)
 
+    if kw.get('fitted_bs_runs_df') is not None:
+        fitted_bs_runs_df = kw['fitted_bs_runs_df']
+        all_xs |= set(fitted_bs_runs_df[xcol].unique())
+        all_group_vals |= set(fitted_bs_runs_df[group_col].unique())
+    else:
+        fitted_bs_runs_df = pd.DataFrame(columns=df.columns)
+
+    if kw.get('const_bs_baseline_df') is not None:
+        const_bs_baseline_df = kw['const_bs_baseline_df']
+        all_xs |= set(const_bs_baseline_df[xcol].unique())
+        all_group_vals |= set(const_bs_baseline_df[group_col].unique())
+    else:
+        const_bs_baseline_df = pd.DataFrame(columns=df.columns)
+
+    if kw.get('utd_scaling_baseline_df') is not None:
+        utd_scaling_baseline_df = kw['utd_scaling_baseline_df']
+        all_xs |= set(utd_scaling_baseline_df[xcol].unique())
+        all_group_vals |= set(utd_scaling_baseline_df[group_col].unique())
+    else:
+        utd_scaling_baseline_df = pd.DataFrame(columns=df.columns)
+
+    if kw.get('n_scaling_baseline_df') is not None:
+        n_scaling_baseline_df = kw['n_scaling_baseline_df']
+        all_xs |= set(n_scaling_baseline_df[xcol].unique())
+        all_group_vals |= set(n_scaling_baseline_df[group_col].unique())
+    else:
+        n_scaling_baseline_df = pd.DataFrame(columns=df.columns)
+
     all_xs = sorted(list(all_xs))
     all_group_vals = sorted(list(all_group_vals))
     x_smooth = np.logspace(np.log10(min(all_xs)), np.log10(max(all_xs)), 100)
@@ -1051,6 +1136,10 @@ def _plot_optimal_hparam_fit_per_env_helper(
         interpolated_env_df = interpolated_df.query(f'env_name=="{env}"')
         extrapolated_env_df = extrapolated_df.query(f'env_name=="{env}"')
         compute_optimal_env_df = compute_optimal_df.query(f'env_name=="{env}"')
+        fitted_bs_env_df = fitted_bs_runs_df.query(f'env_name=="{env}"')
+        const_bs_baseline_env_df = const_bs_baseline_df.query(f'env_name=="{env}"')
+        utd_scaling_baseline_env_df = utd_scaling_baseline_df.query(f'env_name=="{env}"')
+        n_scaling_baseline_env_df = n_scaling_baseline_df.query(f'env_name=="{env}"')
 
         for j, group_val in enumerate(all_group_vals):
             ax = axes[i, j]
@@ -1062,6 +1151,16 @@ def _plot_optimal_hparam_fit_per_env_helper(
                 xcol
             )
             compute_optimal_dta = compute_optimal_env_df.query(
+                f'{group_col}=={group_val}'
+            ).sort_values(xcol)
+            fitted_bs_dta = fitted_bs_env_df.query(f'{group_col}=={group_val}').sort_values(xcol)
+            const_bs_baseline_dta = const_bs_baseline_env_df.query(
+                f'{group_col}=={group_val}'
+            ).sort_values(xcol)
+            utd_scaling_baseline_dta = utd_scaling_baseline_env_df.query(
+                f'{group_col}=={group_val}'
+            ).sort_values(xcol)
+            n_scaling_baseline_dta = n_scaling_baseline_env_df.query(
                 f'{group_col}=={group_val}'
             ).sort_values(xcol)
 
@@ -1081,6 +1180,22 @@ def _plot_optimal_hparam_fit_per_env_helper(
             if len(compute_optimal_dta) > 0:
                 assert compute_optimal_dta[group_label_col].nunique() == 1
                 group_label_val = compute_optimal_dta[group_label_col].iloc[0]
+                flag = True
+            if len(fitted_bs_dta) > 0:
+                assert fitted_bs_dta[group_label_col].nunique() == 1
+                group_label_val = fitted_bs_dta[group_label_col].iloc[0]
+                flag = True
+            if len(const_bs_baseline_dta) > 0:
+                assert const_bs_baseline_dta[group_label_col].nunique() == 1
+                group_label_val = const_bs_baseline_dta[group_label_col].iloc[0]
+                flag = True
+            if len(utd_scaling_baseline_dta) > 0:
+                assert utd_scaling_baseline_dta[group_label_col].nunique() == 1
+                group_label_val = utd_scaling_baseline_dta[group_label_col].iloc[0]
+                flag = True
+            if len(n_scaling_baseline_dta) > 0:
+                assert n_scaling_baseline_dta[group_label_col].nunique() == 1
+                group_label_val = n_scaling_baseline_dta[group_label_col].iloc[0]
                 flag = True
             if not flag:
                 continue
@@ -1126,6 +1241,42 @@ def _plot_optimal_hparam_fit_per_env_helper(
                     capsize=3,
                     color='gold',
                 )
+            if len(fitted_bs_dta) > 0:
+                ax.errorbar(
+                    fitted_bs_dta[xcol],
+                    fitted_bs_dta[ycol],
+                    yerr=fitted_bs_dta[ycol_std] if ycol_std else None,
+                    fmt='^',
+                    capsize=3,
+                    color='red',
+                )
+            if len(const_bs_baseline_dta) > 0:
+                ax.errorbar(
+                    const_bs_baseline_dta[xcol],
+                    const_bs_baseline_dta[ycol],
+                    yerr=const_bs_baseline_dta[ycol_std] if ycol_std else None,
+                    fmt='D',
+                    capsize=3,
+                    color='tab:green',
+                )
+            if len(utd_scaling_baseline_dta) > 0:
+                ax.errorbar(
+                    utd_scaling_baseline_dta[xcol],
+                    utd_scaling_baseline_dta[ycol],
+                    yerr=utd_scaling_baseline_dta[ycol_std] if ycol_std else None,
+                    fmt='p',
+                    capsize=3,
+                    color='darkolivegreen',
+                )
+            if len(n_scaling_baseline_dta) > 0:
+                ax.errorbar(
+                    n_scaling_baseline_dta[xcol],
+                    n_scaling_baseline_dta[ycol],
+                    yerr=n_scaling_baseline_dta[ycol_std] if ycol_std else None,
+                    fmt='d',
+                    capsize=3,
+                    color='sienna',
+                )
 
             for predict_fn, info in predict_fn_info_pairs:
                 label = info['label']
@@ -1159,6 +1310,10 @@ def _plot_optimal_hparam_fit_per_env_helper(
                     | set(interpolated_dta[xcol])
                     | set(extrapolated_dta[xcol])
                     | set(compute_optimal_dta[xcol])
+                    | set(fitted_bs_dta[xcol])
+                    | set(const_bs_baseline_dta[xcol])
+                    | set(utd_scaling_baseline_dta[xcol])
+                    | set(n_scaling_baseline_dta[xcol])
                 )
             )
             yvals = sorted(
@@ -1167,6 +1322,10 @@ def _plot_optimal_hparam_fit_per_env_helper(
                     | set(interpolated_dta[ycol])
                     | set(extrapolated_dta[ycol])
                     | set(compute_optimal_dta[ycol])
+                    | set(fitted_bs_dta[ycol])
+                    | set(const_bs_baseline_dta[ycol])
+                    | set(utd_scaling_baseline_dta[ycol])
+                    | set(n_scaling_baseline_dta[ycol])
                 )
             )
 
@@ -1215,7 +1374,7 @@ def plot_optimal_hparam_fit_per_env_n(
         df,
         group_col=group_col,
         group_label_col='critic_params',
-        xcol='utd',
+        xcol=kw.pop('xcol', 'utd'),
         ycol=ycol,
         ycol_std=ycol_std,
         title=title,
@@ -1583,7 +1742,7 @@ def plot_optimal_hparam_fit_per_env_n_pretty(
     _plot_optimal_hparam_fit_per_env_n_pretty(
         fig, axes, df, ycol, ycol_std, title, predict_fn_info_pairs, group_col='critic_width', **kw
     )
-    yticks = [32, 128, 512, 2048]
+    yticks = kw.get('yticks', [32, 128, 512, 2048])
     for ax in axes.flatten():
         ax.set_yticks(yticks)
         ax.set_yticklabels([str(y) for y in yticks])
@@ -1598,6 +1757,7 @@ def plot_optimal_hparam_fit_per_env_n_pretty(
 def plot_optimal_hparam_fit_per_env_utd_pretty(
     df, ycol, ycol_std, title, predict_fn_info_pairs, **kw
 ):
+    qscaled_plot_utils.set_theme()
     envs = get_envs(df)
     fig, axes = plt.subplots(
         len(envs),
@@ -1608,7 +1768,7 @@ def plot_optimal_hparam_fit_per_env_utd_pretty(
     _plot_optimal_hparam_fit_per_env_utd_pretty(
         fig, axes, df, ycol, ycol_std, title, predict_fn_info_pairs, **kw
     )
-    yticks = [32, 128, 512, 2048]
+    yticks = kw.get('yticks', [32, 128, 512, 2048])
     for ax in axes.flatten():
         ax.set_yticks(yticks)
         ax.set_yticklabels([str(y) for y in yticks])
@@ -1637,7 +1797,7 @@ def plot_optimal_hparam_fit_per_env_combined_pretty(
     _plot_optimal_hparam_fit_per_env_n_pretty(
         fig, axes[1], df, ycol, ycol_std, title, predict_fn_info_pairs, **kw
     )
-    yticks = [32, 128, 512, 2048]
+    yticks = kw.get('yticks', [32, 128, 512, 2048])
     for ax in axes.flatten():
         ax.set_yticks(yticks)
         ax.set_yticklabels([str(y) for y in yticks])
@@ -1645,7 +1805,7 @@ def plot_optimal_hparam_fit_per_env_combined_pretty(
     handles, labels = axes[-1, -1].get_legend_handles_labels()
     handles = [handles[-1]] + handles[:-1]
     labels = [labels[-1]] + labels[:-1]
-    axes[-1, -1].legend(handles, labels, prop={'size': 14}, ncol=1)
+    axes[-1, -1].legend(handles, labels, prop={'size': 14}, ncol=1, frameon=False)
 
     plt.tight_layout(pad=0.0, h_pad=2.0)  # Add vertical padding
     if 'save_path' in kw:

@@ -27,7 +27,7 @@ class make_env:
         self.benchmark = benchmark
         if benchmark == 'shadowhand':
             import gymnasium_robotics
-            from gymnasium.wrappers import FlattenObservation, RescaleAction
+            from gymnasium.wrappers import RescaleAction
 
             gym.register_envs(gymnasium_robotics)
 
@@ -53,9 +53,6 @@ class make_env:
             self.envs = [env_fn() for env_fn in env_fns]
             self.goal_name = 'success'
         if benchmark == 'humanoid_bench':
-            import humanoid_bench
-            from humanoid_bench.env import ROBOTS, TASKS
-
             assert env_name in [
                 'h1-walk-v0',
                 'h1-stand-v0',

@@ -1,5 +1,4 @@
 import os
-
 import numpy as np
 import pandas as pd
 import warnings
@@ -8,6 +7,7 @@ from copy import deepcopy
 from tqdm import tqdm
 from sklearn.isotonic import IsotonicRegression
 from collections import defaultdict
+from zipfile import ZipFile
 
 from qscaled.constants import QSCALED_PATH
 from qscaled.utils.state import remove_with_prompt
@@ -29,7 +29,6 @@ dmc_tasks = {
     'finger-turn',
     'fish-swim',
     'hopper-hop',
-    'pendulum-swingup',
     'quadruped-run',
     'walker-run',
 }
@@ -83,9 +82,7 @@ for task in myosuite_tasks:
 task_to_benchmark['humanoid-stand'] = 'mine_dmc'
 
 
-def load_data():
-    """Load old BRO data"""
-    base_path = '../../../data/ablations_rr'
+def load_old_bro_data(zip_path):
     eval_every_steps = 25000
     bro_param_count = {
         'xs': 0.55e6,
@@ -98,35 +95,32 @@ def load_data():
 
     data_entries = []
 
-    for root, _, files in os.walk(base_path):
-        for file in files:
+    with ZipFile(zip_path, 'r') as zip_ref:
+        for file in zip_ref.namelist():
             if file.endswith('.npy'):
-                # Extract model size and task from the path
-                relative_path = os.path.relpath(os.path.join(root, file), base_path)
-                parts = relative_path.split(os.sep)  # Split the path into parts
+                parts = file.split('/')
 
-                if len(parts) >= 2:  # Ensure it follows the expected structure
-                    utd_part, model_size_part = parts[0].split('_')
+                if len(parts) >= 2:
+                    utd_part, model_size_part = parts[-2].split('_')
                     assert utd_part.startswith('rr')
-                    utd = int(utd_part[2:])  # Extract the UTD value
+                    utd = int(utd_part[2:])
                     param_count = bro_param_count[model_size_part]
 
-                    task = os.path.splitext(parts[1])[0]
+                    task = os.path.splitext(parts[-1])[0]
+                    if task not in task_to_benchmark:
+                        continue
                     benchmark = task_to_benchmark[task]
 
-                    # Load the NumPy array
-                    file_path = os.path.join(root, file)
-                    data_array = np.load(file_path, allow_pickle=True)
+                    with zip_ref.open(file, 'r') as f:
+                        data_array = np.load(f, allow_pickle=True)
 
                     if benchmark in ['metaworld', 'myosuite']:  # normalize returns
                         data_array *= 1000
 
-                    # Append to list
                     data_entries.append(
                         (utd, model_size_part, param_count, benchmark, task, data_array)
                     )
 
-    # Convert to DataFrame
     df = pd.DataFrame(
         data_entries,
         columns=[
@@ -481,164 +475,4 @@ def remove_incomplete(df, max_steps):
     df['desired_max_steps'] = df['env_name'].map(max_steps)
     df = df.query('last_training_step >= desired_max_steps')
     df = df.drop(columns=['last_training_step', 'desired_max_steps'])
-    return df
-
-
-def manual_metrics(df):
-    datas = []
-    df = df.reset_index(drop=True)
-
-    for i, row in df.iterrows():
-        update_dict = {
-            'mean_validation_overfitting': (
-                row['mean_validation_critic_loss'] - row['mean_critic_loss']
-            ),
-            'std_validation_overfitting': np.sqrt(
-                row['std_validation_critic_loss'] ** 2 + row['std_critic_loss'] ** 2
-            ),
-            'mean_new_data_overfitting': (
-                row['mean_new_data_critic_loss'] - row['mean_critic_loss']
-            ),
-            'std_new_data_overfitting': np.sqrt(
-                row['std_new_data_critic_loss'] ** 2 + row['std_critic_loss'] ** 2
-            ),
-            'mean_old_data_overfitting': (
-                row['mean_old_data_critic_loss'] - row['mean_critic_loss']
-            ),
-            'std_old_data_overfitting': np.sqrt(
-                row['std_old_data_critic_loss'] ** 2 + row['std_critic_loss'] ** 2
-            ),
-            'mean_sum_critic_grad_var_manual': (
-                row['mean_mean_critic_grad_var'] * row['critic_params']
-            ),
-            'std_sum_critic_grad_var_manual': (
-                row['std_mean_critic_grad_var'] * row['critic_params']
-            ),
-            'mean_sum_critic_grad_var_div_b_manual': (
-                row['mean_mean_critic_grad_var'] * row['critic_params'] / row['batch_size']
-            ),
-            'std_sum_critic_grad_var_div_b_manual': (
-                row['std_mean_critic_grad_var'] * row['critic_params'] / row['batch_size']
-            ),
-            'mean_adam_sum_grad_var_manual': (
-                row['mean_adam_mean_critic_grad_var'] * row['critic_params']
-            ),
-            'std_adam_sum_grad_var_manual': (
-                row['std_adam_mean_critic_grad_var'] * row['critic_params']
-            ),
-            'mean_relative_grad_var_manual': (
-                row['mean_mean_critic_grad_var']
-                * row['critic_params']
-                / row['mean_critic_gnorm'] ** 2
-            ),
-            'std_relative_grad_var_manual': (
-                row['std_mean_critic_grad_var']
-                * row['critic_params']
-                / row['mean_critic_gnorm'] ** 2
-            ),
-            'mean_sep_validation_overfitting': (
-                row['mean_sep_validation_critic_loss']
-                - row[
-                    'mean_replay_separate_critic_loss'
-                ]  # same in expectation, though would be good to fix
-            ),
-            'std_sep_validation_overfitting': np.sqrt(
-                row['std_sep_validation_critic_loss'] ** 2
-                + row['std_replay_separate_critic_loss'] ** 2
-            ),
-            'mean_sep_new_data_overfitting': (
-                row['mean_new_data_separate_critic_loss'] - row['mean_replay_separate_critic_loss']
-            ),
-            'std_sep_new_data_overfitting': np.sqrt(
-                row['std_new_data_separate_critic_loss'] ** 2
-                + row['std_replay_separate_critic_loss'] ** 2
-            ),
-            'mean_sep_old_data_overfitting': (
-                row['mean_old_data_separate_critic_loss'] - row['mean_replay_separate_critic_loss']
-            ),
-            'std_sep_old_data_overfitting': np.sqrt(
-                row['std_old_data_separate_critic_loss'] ** 2
-                + row['std_replay_separate_critic_loss'] ** 2
-            ),
-        }
-
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', category=RuntimeWarning)
-
-            for col in row.index:
-                if col.startswith('old_target_critic_loss'):
-                    grad_steps = int(float(col.split('_')[-1]) * row['utd'])
-                    good_cols = (~np.isnan(row[col])).all(axis=0)
-                    update_dict[f'mean_old_target_critic_loss_{grad_steps}'] = np.nanmean(
-                        row[col], axis=1
-                    )
-                    update_dict[f'mean_old_target_overfitting_{grad_steps}'] = np.nanstd(
-                        row[col] - row['critic_loss'], axis=1
-                    ) / np.sqrt(len(good_cols))
-                    update_dict[f'std_old_target_critic_loss_{grad_steps}'] = np.nanmean(
-                        row[col], axis=1
-                    )
-                    update_dict[f'std_old_target_overfitting_{grad_steps}'] = np.nanstd(
-                        row[col] - row['critic_loss'], axis=1
-                    ) / np.sqrt(len(good_cols))
-
-            # simple noise scale using B=256
-            simple_noise_scale_quotient = (
-                row['mean_critic_grad_var'] * row['critic_params'] / row['grad_norm_b256'] ** 2
-            )
-            good_cols = (~np.isnan(simple_noise_scale_quotient)).all(axis=0)
-            update_dict['mean_simple_noise_scale_quotient'] = np.nanmean(
-                simple_noise_scale_quotient, axis=1
-            )
-            update_dict['std_simple_noise_scale_quotient'] = np.nanstd(
-                simple_noise_scale_quotient, axis=1
-            ) / np.sqrt(len(good_cols))
-
-            # critical batch size
-            grad_norm_batch_sizes = [
-                int(col[len('grad_norm_b') :]) for col in row.index if col.startswith('grad_norm_b')
-            ]
-            grad_norm_batch_sizes = sorted(grad_norm_batch_sizes)
-
-            for i in range(len(grad_norm_batch_sizes) - 1):
-                for j in range(i + 1, len(grad_norm_batch_sizes)):
-                    b_small = grad_norm_batch_sizes[i]
-                    b_large = grad_norm_batch_sizes[j]
-                    grad_norm_b_small = row[f'grad_norm_b{b_small}']
-                    grad_norm_b_large = row[f'grad_norm_b{b_large}']
-
-                    good_cols = ~(np.isnan(grad_norm_b_small).all(axis=0)) & ~(
-                        np.isnan(grad_norm_b_large).all(axis=0)
-                    )
-
-                    grad_norm_b_small_smooth = (
-                        pd.DataFrame(grad_norm_b_small).rolling(10).mean().to_numpy()
-                    )
-                    grad_norm_b_large_smooth = (
-                        pd.DataFrame(grad_norm_b_large).rolling(10).mean().to_numpy()
-                    )
-
-                    G_squared = (
-                        b_large * grad_norm_b_large_smooth**2
-                        - b_small * grad_norm_b_small_smooth**2
-                    ) / (b_large - b_small)
-
-                    S = (grad_norm_b_small_smooth**2 - grad_norm_b_large_smooth**2) / (
-                        1 / b_small - 1 / b_large
-                    )
-
-                    update_dict[f'mean_simple_noise_scale_{b_small}_{b_large}'] = np.nanmean(
-                        S / G_squared, axis=1
-                    )
-                    update_dict[f'std_simple_noise_scale_{b_small}_{b_large}'] = np.nanstd(
-                        S / G_squared, axis=1
-                    ) / np.sqrt(len(good_cols))
-
-            datas.append(update_dict)
-
-    new_df = pd.DataFrame(datas)
-    new_df_new_cols = new_df.drop(columns=df.columns.intersection(new_df.columns))
-    df.update(new_df)
-    df = pd.concat([df, new_df_new_cols], axis=1)
-
     return df

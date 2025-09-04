@@ -270,14 +270,14 @@ def plot_data_efficiency_per_env(data_efficiency_dict, df, thresholds_per_env, t
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
     axes = axes.flatten()
-    fig.suptitle(f'Data Efficiency by Environment', fontsize=14)
+    fig.suptitle('Data Efficiency by Environment', fontsize=14)
     colors = sns.color_palette('viridis', n_colors=len(model_sizes))
 
     lines, labels = [], []
 
     for i, env in enumerate(envs):
         axes[i].set_xlabel('UTD')
-        axes[i].set_ylabel(f'Env steps to Threshold')
+        axes[i].set_ylabel('Env steps to Threshold')
         axes[i].set_title(f'{env} (threshold {round(thresholds_per_env[env][threshold_idx], 2)})')
 
         if env in data_efficiency_dict and len(data_efficiency_dict[env]) > 0:
@@ -323,14 +323,14 @@ def plot_data_efficiency_per_env(data_efficiency_dict, df, thresholds_per_env, t
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
     axes = axes.flatten()
-    fig.suptitle(f'Data Efficiency by Environment', fontsize=14)
+    fig.suptitle('Data Efficiency by Environment', fontsize=14)
     colors = sns.color_palette('viridis', n_colors=len(utds))
 
     lines, labels = [], []
 
     for i, env in enumerate(envs):
         axes[i].set_xlabel('Model size')
-        axes[i].set_ylabel(f'Env steps to Threshold')
+        axes[i].set_ylabel('Env steps to Threshold')
         axes[i].set_title(f'{env} (threshold {round(thresholds_per_env[env][threshold_idx], 2)})')
 
         if env in data_efficiency_dict and len(data_efficiency_dict[env]) > 0:
@@ -473,7 +473,7 @@ def plot_average_return_per_env(df):
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows))
     axes = axes.flatten()
-    fig.suptitle(f'Average return by environment', fontsize=14)
+    fig.suptitle('Average return by environment', fontsize=14)
     colors = sns.color_palette('viridis', n_colors=len(model_sizes))
     lines, labels = [], []
 
@@ -523,7 +523,7 @@ def plot_average_return_per_env(df):
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows))
     axes = axes.flatten()
-    fig.suptitle(f'Average return by environment', fontsize=14)
+    fig.suptitle('Average return by environment', fontsize=14)
     colors = sns.color_palette('viridis', n_colors=len(utds))
     lines, labels = [], []
 
@@ -578,7 +578,7 @@ def plot_average_return_averaged(df):
     model_sizes = get_model_sizes(df)
 
     fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-    fig.suptitle(f'Average return, averaged over environments')
+    fig.suptitle('Average return, averaged over environments')
     colors = sns.color_palette('viridis', n_colors=len(model_sizes))
     lines, labels = [], []
 
@@ -623,7 +623,7 @@ def plot_average_return_averaged(df):
     plt.show()
 
     fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-    fig.suptitle(f'Average return, averaged over environments')
+    fig.suptitle('Average return, averaged over environments')
     colors = sns.color_palette('viridis', n_colors=len(model_sizes))
     lines, labels = [], []
 
@@ -1032,7 +1032,7 @@ def _plot_optimal_hparam_fit_per_env_multiple_thresh_helper_pretty(
             rliable_plot_utils._annotate_and_decorate_axis(
                 ax,
                 xlabel=(
-                    r'$N$: Model size' if group_label_col == 'critic_params' else r'$\sigma$: UTD'
+                    r'$\sigma$: UTD' if group_label_col == 'critic_params' else r'$N$: Model size'
                 )
                 if i == len(envs) - 1
                 else '',
@@ -1061,7 +1061,7 @@ def _plot_optimal_hparam_fit_per_env_multiple_thresh_helper_pretty(
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
         cbar = plt.colorbar(sm, cax=cax)
-        cbar.set_label(f'$J$: Return', size='xx-large')
+        cbar.set_label('$J$: Return', size='xx-large')
         cbar.ax.tick_params(labelsize='xx-large')
 
     # cax = fig.add_axes([0.91, 0.15, 0.01, 0.7])  # Adjust as needed

@@ -209,7 +209,7 @@ def _compute_critic_loss_jit(
     return _compute_critic_loss(key, actor, critic, target_critic, temp, batch, discount, pessimism)
 
 
-# @jax.jit
+@jax.jit
 @functools.partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, None, None, None))
 def _compute_quantile_loss_jit(
     rng: PRNGKey,
